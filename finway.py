@@ -10,6 +10,7 @@
 import glob
 import re
 import statistics
+import subprocess
 from datetime import date, timedelta
 from math import sqrt
 from pathlib import Path
@@ -165,19 +166,49 @@ def detect_recurring_payees(
     }
 
 
+def detect_recurring_credits(
+    transactions: list[tuple[date, str, float, float]],
+    min_months: int = 2,
+) -> dict[str, list[float]]:
+    """Auto-detect recurring credit sources from transaction history.
+
+    A source is considered recurring if it appears as a credit in at least
+    `min_months` distinct calendar months. Returns a dict mapping normalized
+    source key -> list of observed amounts.
+    """
+    month_occurrences: dict[str, set[tuple[int, int]]] = {}
+    all_amounts: dict[str, list[float]] = {}
+
+    for tx_date, description, amount, _balance in transactions:
+        if amount <= 0:
+            continue
+        key = normalize_payee(description)
+        month_occurrences.setdefault(key, set()).add((tx_date.year, tx_date.month))
+        all_amounts.setdefault(key, []).append(amount)
+
+    return {
+        key: amounts
+        for key, amounts in all_amounts.items()
+        if len(month_occurrences[key]) >= min_months
+    }
+
+
 def compute_burn_projection(
     records: list[tuple[date, float]],
     recurring: dict[str, list[float]],
+    credits: dict[str, list[float]] | None = None,
     max_days_ahead: int = 730,
 ) -> dict:
-    """Project balance decline driven purely by guaranteed recurring debits.
+    """Project balance change driven by net recurring cash flows.
 
-    The slope is always negative. Uncertainty bands widen proportionally to
+    Incorporates both recurring debits and (optionally) recurring credits to
+    compute a net burn rate. Uncertainty bands widen proportionally to
     sqrt(months elapsed), reflecting compounding variance across monthly payments.
+    If recurring income exceeds debits, the balance never hits zero.
     """
     last_date, last_balance = records[-1]
 
-    # Per-payee statistics
+    # Per-payee debit statistics
     means = {p: statistics.mean(amounts) for p, amounts in recurring.items()}
     variances = {
         p: statistics.variance(amounts) if len(amounts) > 1 else 0.0
@@ -185,16 +216,31 @@ def compute_burn_projection(
     }
 
     monthly_burn = sum(means.values())          # total guaranteed monthly outflow ($)
-    monthly_var = sum(variances.values())        # total monthly variance
+    monthly_var = sum(variances.values())        # debit variance
+
+    # Recurring income offsets outflows
+    monthly_income = sum(
+        statistics.mean(amts) for amts in (credits or {}).values()
+    )
+    credit_var = sum(
+        statistics.variance(amts) if len(amts) > 1 else 0.0
+        for amts in (credits or {}).values()
+    )
+
+    net_monthly_burn = monthly_burn - monthly_income
+    monthly_var += credit_var
     monthly_std = sqrt(monthly_var)
 
-    daily_burn = monthly_burn / 30.44            # convert to per-day rate
+    daily_burn = net_monthly_burn / 30.44       # net per-day rate
 
-    # Days until balance hits zero on the central projection
-    zero_day = last_balance / daily_burn
-    zero_date = last_date + timedelta(days=int(zero_day))
+    if net_monthly_burn > 0:
+        zero_day = last_balance / daily_burn
+        zero_date = last_date + timedelta(days=int(zero_day))
+        end_day = min(int(zero_day * 1.1), max_days_ahead)
+    else:
+        zero_date = None
+        end_day = max_days_ahead
 
-    end_day = min(int(zero_day * 1.1), max_days_ahead)
     x_days = np.linspace(0, end_day, 400)       # days from last_date
 
     # Central projection
@@ -212,6 +258,7 @@ def compute_burn_projection(
     return {
         "slope": -daily_burn,
         "monthly_burn": monthly_burn,
+        "monthly_income": monthly_income,
         "monthly_std": monthly_std,
         "zero_date": zero_date,
         "plot_dates": plot_dates,
@@ -230,7 +277,7 @@ def build_payee_table_html(recurring: dict[str, list[float]]) -> str:
         rows.append(
             f"<tr style='border-bottom:1px solid #f0f0f0;'>"
             f"<td style='padding:8px 16px;'>{payee.title()}</td>"
-            f"<td style='padding:8px 16px;text-align:right;font-family:monospace;'>${avg:,.2f}</td>"
+            f"<td style='padding:8px 16px;text-align:right;font-family:monospace;color:#dc143c;'>${avg:,.2f}</td>"
             f"<td style='padding:8px 16px;color:#888;'>Monthly</td>"
             f"</tr>"
         )
@@ -241,6 +288,33 @@ def build_payee_table_html(recurring: dict[str, list[float]]) -> str:
         "<thead><tr style='border-bottom:2px solid #ddd;color:#666;"
         "text-transform:uppercase;font-size:11px;letter-spacing:.05em;'>"
         "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Payee</th>"
+        "<th style='padding:8px 16px;text-align:right;font-weight:600;'>Avg / Month</th>"
+        "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Interval</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody>"
+        "</table></div>"
+    )
+
+
+def build_credits_table_html(credits: dict[str, list[float]]) -> str:
+    """Return a styled HTML table of detected recurring credits for embedding below the chart."""
+    rows = []
+    for source, amounts in credits.items():
+        avg = statistics.mean(amounts)
+        rows.append(
+            f"<tr style='border-bottom:1px solid #f0f0f0;'>"
+            f"<td style='padding:8px 16px;'>{source.title()}</td>"
+            f"<td style='padding:8px 16px;text-align:right;font-family:monospace;color:#2a7a3b;'>+${avg:,.2f}</td>"
+            f"<td style='padding:8px 16px;color:#888;'>Monthly</td>"
+            f"</tr>"
+        )
+    return (
+        "<div style='max-width:900px;margin:24px auto;font-family:sans-serif;'>"
+        "<h3 style='margin-bottom:8px;font-size:15px;color:#444;'>Detected Recurring Credits</h3>"
+        "<table style='border-collapse:collapse;width:100%;font-size:14px;'>"
+        "<thead><tr style='border-bottom:2px solid #ddd;color:#666;"
+        "text-transform:uppercase;font-size:11px;letter-spacing:.05em;'>"
+        "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Source</th>"
         "<th style='padding:8px 16px;text-align:right;font-weight:600;'>Avg / Month</th>"
         "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Interval</th>"
         "</tr></thead>"
@@ -355,6 +429,7 @@ def main():
 
     transactions = parse_transactions("data")
     recurring = detect_recurring_payees(transactions)
+    credits = detect_recurring_credits(transactions)
 
     print("Recurring debits detected:")
     for payee, amounts in recurring.items():
@@ -363,12 +438,21 @@ def main():
         obs = ", ".join(f"${a:.2f}" for a in amounts)
         print(f"  {payee:<40}  avg ${avg:>8,.2f}/mo  ({n} obs: {obs})")
 
+    print("\nRecurring credits detected:")
+    for source, amounts in credits.items():
+        avg = statistics.mean(amounts)
+        n = len(amounts)
+        obs = ", ".join(f"${a:.2f}" for a in amounts)
+        print(f"  {source:<40}  avg ${avg:>8,.2f}/mo  ({n} obs: {obs})")
+
     if not recurring:
         print("ERROR: No recurring debits found — cannot project burn rate.")
         return
 
-    proj = compute_burn_projection(records, recurring)
-    print(f"\nGuaranteed monthly burn:  ${proj['monthly_burn']:,.2f}")
+    proj = compute_burn_projection(records, recurring, credits)
+    print(f"\nGross monthly burn:       ${proj['monthly_burn']:,.2f}")
+    print(f"Recurring income:        +${proj['monthly_income']:,.2f}")
+    print(f"Net monthly burn:         ${proj['monthly_burn'] - proj['monthly_income']:,.2f}")
     print(f"Monthly std dev:          ±${proj['monthly_std']:,.2f}")
     if proj["zero_date"]:
         print(f"Projected $0:             {proj['zero_date'].strftime('%B %d, %Y')}")
@@ -377,9 +461,13 @@ def main():
     chart_html = Path("burn_rate.html")
     fig.write_html(chart_html)
     html = chart_html.read_text(encoding="utf-8")
-    html = html.replace("</body>", f"{build_payee_table_html(recurring)}\n</body>", 1)
+    table_block = build_payee_table_html(recurring)
+    if credits:
+        table_block += build_credits_table_html(credits)
+    html = html.replace("</body>", f"{table_block}\n</body>", 1)
     chart_html.write_text(html, encoding="utf-8")
     print("\nSaved: burn_rate.html")
+    subprocess.run(["open", chart_html])
 
 
 if __name__ == "__main__":
