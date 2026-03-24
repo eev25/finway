@@ -229,7 +229,7 @@ def build_figure(
             y=proj["y_hat"],
             mode="lines",
             line=dict(color="rgba(255, 127, 14, 0.9)", width=2, dash="dash"),
-            name=f"Projected Burn (−${monthly_burn:,.0f}/mo guaranteed)",
+            name=f"Projected Burn",
         )
     )
 
