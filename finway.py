@@ -18,12 +18,10 @@ import numpy as np
 import plotly.graph_objs as go
 from scipy import stats
 
-RECURRING_PAYEES = [
-    "WASHINGTON GAS",
-    "PEPCO PAYMENTUS",
-    "PENNYMAC",
-    "VERIZON*RECURRING PAY",
-]
+# Strips ACH metadata fields (DES:, ID:, INDN:, CO ID:, SEC code)
+_ACH_SUFFIX = re.compile(r'\s+DES:.*$', re.IGNORECASE)
+# Strips inline MM/DD date patterns in non-ACH descriptions (e.g. "01/07")
+_INLINE_DATE = re.compile(r'\s+\d{2}/\d{2}\b')
 
 # Matches rows with both an Amount AND a Running Balance column
 _TX_FULL = re.compile(
@@ -126,19 +124,45 @@ def parse_transactions(data_dir: str = "data") -> list[tuple[date, str, float, f
     return results
 
 
-def extract_recurring_debits(
+def normalize_payee(description: str) -> str:
+    """Return a stable, uppercase payee key from a raw transaction description.
+
+    ACH transactions (contain ' DES:'): take everything before that token.
+    Non-ACH transactions: strip inline MM/DD date patterns.
+    """
+    desc = description.strip()
+    if re.search(r'\bDES:', desc, re.IGNORECASE):
+        desc = _ACH_SUFFIX.sub('', desc)
+    else:
+        desc = _INLINE_DATE.sub('', desc)
+    return desc.upper().strip()
+
+
+def detect_recurring_payees(
     transactions: list[tuple[date, str, float, float]],
+    min_months: int = 2,
 ) -> dict[str, list[float]]:
-    """Group observed amounts (as positive values) for each known recurring payee."""
-    grouped: dict[str, list[float]] = {p: [] for p in RECURRING_PAYEES}
+    """Auto-detect recurring debit payees from transaction history.
+
+    A payee is considered recurring if it appears as a debit in at least
+    `min_months` distinct calendar months. Returns a dict mapping normalized
+    payee key -> list of observed amounts (as positive values).
+    """
+    month_occurrences: dict[str, set[tuple[int, int]]] = {}
+    all_amounts: dict[str, list[float]] = {}
 
     for tx_date, description, amount, _balance in transactions:
-        desc_upper = description.upper()
-        for payee in RECURRING_PAYEES:
-            if payee in desc_upper and amount < 0:
-                grouped[payee].append(abs(amount))
+        if amount >= 0:
+            continue
+        key = normalize_payee(description)
+        month_occurrences.setdefault(key, set()).add((tx_date.year, tx_date.month))
+        all_amounts.setdefault(key, []).append(abs(amount))
 
-    return {p: amounts for p, amounts in grouped.items() if amounts}
+    return {
+        key: amounts
+        for key, amounts in all_amounts.items()
+        if len(month_occurrences[key]) >= min_months
+    }
 
 
 def compute_burn_projection(
@@ -196,6 +220,33 @@ def compute_burn_projection(
         "y_lower": y_lower,
         "recurring_breakdown": means,
     }
+
+
+def build_payee_table_html(recurring: dict[str, list[float]]) -> str:
+    """Return a styled HTML table of detected recurring payees for embedding below the chart."""
+    rows = []
+    for payee, amounts in recurring.items():
+        avg = statistics.mean(amounts)
+        rows.append(
+            f"<tr style='border-bottom:1px solid #f0f0f0;'>"
+            f"<td style='padding:8px 16px;'>{payee.title()}</td>"
+            f"<td style='padding:8px 16px;text-align:right;font-family:monospace;'>${avg:,.2f}</td>"
+            f"<td style='padding:8px 16px;color:#888;'>Monthly</td>"
+            f"</tr>"
+        )
+    return (
+        "<div style='max-width:900px;margin:24px auto;font-family:sans-serif;'>"
+        "<h3 style='margin-bottom:8px;font-size:15px;color:#444;'>Detected Recurring Debits</h3>"
+        "<table style='border-collapse:collapse;width:100%;font-size:14px;'>"
+        "<thead><tr style='border-bottom:2px solid #ddd;color:#666;"
+        "text-transform:uppercase;font-size:11px;letter-spacing:.05em;'>"
+        "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Payee</th>"
+        "<th style='padding:8px 16px;text-align:right;font-weight:600;'>Avg / Month</th>"
+        "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Interval</th>"
+        "</tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody>"
+        "</table></div>"
+    )
 
 
 def build_figure(
@@ -303,18 +354,14 @@ def main():
     print(f"Last known balance: ${records[-1][1]:,.2f} on {records[-1][0]}\n")
 
     transactions = parse_transactions("data")
-    recurring = extract_recurring_debits(transactions)
+    recurring = detect_recurring_payees(transactions)
 
-    print("Recurring debits found:")
-    for payee in RECURRING_PAYEES:
-        if payee in recurring:
-            amounts = recurring[payee]
-            avg = statistics.mean(amounts)
-            n = len(amounts)
-            obs = ", ".join(f"${a:.2f}" for a in amounts)
-            print(f"  {payee:<26}  avg ${avg:>8,.2f}/mo  ({n} obs: {obs})")
-        else:
-            print(f"  {payee:<26}  (no observations found)")
+    print("Recurring debits detected:")
+    for payee, amounts in recurring.items():
+        avg = statistics.mean(amounts)
+        n = len(amounts)
+        obs = ", ".join(f"${a:.2f}" for a in amounts)
+        print(f"  {payee:<40}  avg ${avg:>8,.2f}/mo  ({n} obs: {obs})")
 
     if not recurring:
         print("ERROR: No recurring debits found — cannot project burn rate.")
@@ -327,9 +374,12 @@ def main():
         print(f"Projected $0:             {proj['zero_date'].strftime('%B %d, %Y')}")
 
     fig = build_figure(records, proj)
-    fig.write_html("burn_rate.html")
+    chart_html = Path("burn_rate.html")
+    fig.write_html(chart_html)
+    html = chart_html.read_text(encoding="utf-8")
+    html = html.replace("</body>", f"{build_payee_table_html(recurring)}\n</body>", 1)
+    chart_html.write_text(html, encoding="utf-8")
     print("\nSaved: burn_rate.html")
-    fig.show()
 
 
 if __name__ == "__main__":
