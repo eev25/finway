@@ -269,58 +269,101 @@ def compute_burn_projection(
     }
 
 
-def build_payee_table_html(recurring: dict[str, list[float]]) -> str:
-    """Return a styled HTML table of detected recurring payees for embedding below the chart."""
+def _build_recurring_table_html(
+    data: dict[str, list[float]],
+    title: str,
+    col_label: str,
+    amount_color: str,
+    amount_prefix: str,
+) -> str:
     rows = []
-    for payee, amounts in recurring.items():
+    for name, amounts in data.items():
         avg = statistics.mean(amounts)
         rows.append(
             f"<tr style='border-bottom:1px solid #f0f0f0;'>"
-            f"<td style='padding:8px 16px;'>{payee.title()}</td>"
-            f"<td style='padding:8px 16px;text-align:right;font-family:monospace;color:#dc143c;'>${avg:,.2f}</td>"
+            f"<td style='padding:8px 16px;'>{name.title()}</td>"
+            f"<td style='padding:8px 16px;text-align:right;font-family:monospace;"
+            f"color:{amount_color};'>{amount_prefix}${avg:,.2f}</td>"
             f"<td style='padding:8px 16px;color:#888;'>Monthly</td>"
             f"</tr>"
         )
     return (
         "<div style='max-width:900px;margin:24px auto;font-family:sans-serif;'>"
-        "<h3 style='margin-bottom:8px;font-size:15px;color:#444;'>Detected Recurring Debits</h3>"
+        f"<h3 style='margin-bottom:8px;font-size:15px;color:#444;'>{title}</h3>"
         "<table style='border-collapse:collapse;width:100%;font-size:14px;'>"
         "<thead><tr style='border-bottom:2px solid #ddd;color:#666;"
         "text-transform:uppercase;font-size:11px;letter-spacing:.05em;'>"
-        "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Payee</th>"
+        f"<th style='padding:8px 16px;text-align:left;font-weight:600;'>{col_label}</th>"
         "<th style='padding:8px 16px;text-align:right;font-weight:600;'>Avg / Month</th>"
         "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Interval</th>"
         "</tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody>"
         "</table></div>"
     )
+
+
+def build_payee_table_html(recurring: dict[str, list[float]]) -> str:
+    return _build_recurring_table_html(recurring, "Detected Recurring Debits", "Payee", "#dc143c", "")
 
 
 def build_credits_table_html(credits: dict[str, list[float]]) -> str:
-    """Return a styled HTML table of detected recurring credits for embedding below the chart."""
-    rows = []
-    for source, amounts in credits.items():
-        avg = statistics.mean(amounts)
-        rows.append(
-            f"<tr style='border-bottom:1px solid #f0f0f0;'>"
-            f"<td style='padding:8px 16px;'>{source.title()}</td>"
-            f"<td style='padding:8px 16px;text-align:right;font-family:monospace;color:#2a7a3b;'>+${avg:,.2f}</td>"
-            f"<td style='padding:8px 16px;color:#888;'>Monthly</td>"
-            f"</tr>"
-        )
-    return (
-        "<div style='max-width:900px;margin:24px auto;font-family:sans-serif;'>"
-        "<h3 style='margin-bottom:8px;font-size:15px;color:#444;'>Detected Recurring Credits</h3>"
-        "<table style='border-collapse:collapse;width:100%;font-size:14px;'>"
-        "<thead><tr style='border-bottom:2px solid #ddd;color:#666;"
-        "text-transform:uppercase;font-size:11px;letter-spacing:.05em;'>"
-        "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Source</th>"
-        "<th style='padding:8px 16px;text-align:right;font-weight:600;'>Avg / Month</th>"
-        "<th style='padding:8px 16px;text-align:left;font-weight:600;'>Interval</th>"
-        "</tr></thead>"
-        "<tbody>" + "".join(rows) + "</tbody>"
-        "</table></div>"
-    )
+    return _build_recurring_table_html(credits, "Detected Recurring Credits", "Source", "#2a7a3b", "+")
+
+
+def build_page_html(
+    chart_fragment: str,
+    recurring: dict[str, list[float]],
+    credits: dict[str, list[float]],
+) -> str:
+    """Assemble a complete HTML page with chart on the left, tables stacked on the right."""
+    debits_html = build_payee_table_html(recurring)
+    right_cells = f"<div class='table-col top'>{debits_html}</div>"
+    if credits:
+        right_cells += f"<div class='table-col bottom'>{build_credits_table_html(credits)}</div>"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Bank Account Burn Rate</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; }}
+  body {{ margin: 0; padding: 0; background: white; }}
+  .layout {{
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    height: 100vh;
+  }}
+  .chart-col {{
+    grid-row: span 2;
+    overflow: hidden;
+    padding: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  .chart-col > * {{
+    width: 100%;
+    height: auto;
+    aspect-ratio: 16 / 9;
+  }}
+  .chart-col .plotly-graph-div {{ height: 100% !important; }}
+  .table-col {{
+    overflow-y: auto;
+    padding: 12px 16px;
+    border-left: 1px solid #e8e8e8;
+  }}
+  .table-col.top {{ border-bottom: 1px solid #e8e8e8; }}
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="chart-col">{chart_fragment}</div>
+  {right_cells}
+</div>
+</body>
+</html>"""
 
 
 def build_figure(
@@ -459,13 +502,8 @@ def main():
 
     fig = build_figure(records, proj)
     chart_html = Path("burn_rate.html")
-    fig.write_html(chart_html)
-    html = chart_html.read_text(encoding="utf-8")
-    table_block = build_payee_table_html(recurring)
-    if credits:
-        table_block += build_credits_table_html(credits)
-    html = html.replace("</body>", f"{table_block}\n</body>", 1)
-    chart_html.write_text(html, encoding="utf-8")
+    chart_fragment = fig.to_html(full_html=False, include_plotlyjs=True)
+    chart_html.write_text(build_page_html(chart_fragment, recurring, credits), encoding="utf-8")
     print("\nSaved: burn_rate.html")
     subprocess.run(["open", chart_html])
 
