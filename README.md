@@ -1,6 +1,7 @@
 # finway
 
 Plots your financial data including extrapolating future expenses by analyzing your bank statments for recurring debits and credits.
+Useful for quickly visualizing your business account burn rate.
 
 ## Example
 
