@@ -325,7 +325,7 @@ def build_page_html(
 <html>
 <head>
 <meta charset="utf-8">
-<title>Bank Account Burn Rate</title>
+<title>Financial Runway</title>
 <style>
   *, *::before, *::after {{ box-sizing: border-box; }}
   body {{ margin: 0; padding: 0; background: white; }}
@@ -448,7 +448,7 @@ def build_figure(
 
     fig = go.Figure(data=traces)
     fig.update_layout(
-        title=dict(text="Bank Account Burn Rate", font=dict(size=22)),
+        title=dict(text="Financial Runway", font=dict(size=22)),
         xaxis_title="Date",
         yaxis_title="Balance (USD)",
         yaxis_tickprefix="$",
